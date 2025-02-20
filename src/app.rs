@@ -26,6 +26,7 @@ use notemancy_core::scan::{ScannedFile, Scanner};
 use notemancy_core::search::{Document, SearchInterface};
 
 use once_cell::sync::Lazy;
+use pulldown_cmark::{CodeBlockKind, Event as MdEvent, Parser, Tag};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
@@ -34,8 +35,6 @@ static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(SyntaxSet::load_defaults_newlines
 static THEME_SET: Lazy<ThemeSet> = Lazy::new(ThemeSet::load_defaults);
 
 fn highlight_markdown(content: &str) -> Vec<Line> {
-    use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag};
-    // Create a parser for the markdown content.
     let parser = Parser::new(content);
     let mut lines = Vec::new();
     let mut in_code_block = false;
@@ -44,11 +43,10 @@ fn highlight_markdown(content: &str) -> Vec<Line> {
 
     for event in parser {
         match event {
-            Event::Start(Tag::CodeBlock(info)) => {
+            MdEvent::Start(Tag::CodeBlock(info)) => {
                 in_code_block = true;
                 match info {
                     CodeBlockKind::Fenced(lang) => {
-                        // Store the language as an owned string.
                         code_lang = lang.to_string().to_owned();
                     }
                     CodeBlockKind::Indented => {
@@ -56,14 +54,13 @@ fn highlight_markdown(content: &str) -> Vec<Line> {
                     }
                 }
             }
-            Event::End(Tag::CodeBlock(_)) => {
-                // End of code block; perform highlighting.
+            MdEvent::End(Tag::CodeBlock(_)) => {
                 let syntax = SYNTAX_SET
                     .find_syntax_by_token(code_lang.as_str())
                     .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text());
                 let theme = &THEME_SET.themes["base16-ocean.dark"];
                 let mut highlighter = HighlightLines::new(syntax, theme);
-                // Collect lines from code_buffer so that we don't borrow while clearing.
+                // Collect lines so we don't hold a borrow on code_buffer.
                 let code_lines: Vec<&str> = code_buffer.lines().collect();
                 for line in code_lines {
                     let ranges = highlighter.highlight(line, &SYNTAX_SET);
@@ -71,7 +68,6 @@ fn highlight_markdown(content: &str) -> Vec<Line> {
                         .into_iter()
                         .map(|(s, text)| {
                             let fg = Color::Rgb(s.foreground.r, s.foreground.g, s.foreground.b);
-                            // Convert the text to an owned String.
                             Span::styled(text.to_string(), Style::default().fg(fg))
                         })
                         .collect();
@@ -80,17 +76,16 @@ fn highlight_markdown(content: &str) -> Vec<Line> {
                 code_buffer.clear();
                 in_code_block = false;
             }
-            Event::Text(text) => {
+            MdEvent::Text(text) => {
                 if in_code_block {
                     code_buffer.push_str(&text);
                 } else {
-                    // For normal text, split into lines and make them owned.
                     for line in text.lines() {
                         lines.push(Line::from(line.to_string()));
                     }
                 }
             }
-            Event::SoftBreak | Event::HardBreak => {
+            MdEvent::SoftBreak | MdEvent::HardBreak => {
                 if !in_code_block {
                     lines.push(Line::from(String::new()));
                 }
@@ -120,17 +115,14 @@ pub struct App {
     spinner_chars: Vec<char>,
     scan_result: Option<Vec<ScannedFile>>,
     scan_summary: Option<String>,
-    // Channel carries the tuple (scanned files, summary) from scanning.
     scanning_receiver: ScanReceiver,
     last_tick: Instant,
     // For search mode:
     search_query: String,
-    // Instead of strings, we store Documents to show file content.
     search_results: Vec<Document>,
     selected_search_index: usize,
     // Store the search interface.
     search_interface: Option<Arc<SearchInterface>>,
-    // Channel to signal that indexing is complete.
     indexing_receiver: IndexReceiver,
 }
 
@@ -182,14 +174,14 @@ impl App {
         self.search_interface = Some(Arc::new(si));
     }
 
-    pub fn run<B: ratatui::backend::Backend>(
+    // Notice the terminal type is now fixed:
+    pub fn run(
         mut self,
-        terminal: &mut ratatui::Terminal<B>,
+        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
         enable_raw_mode()?;
         println!("notemancy is starting");
 
-        // Spawn the scanning thread.
         let (tx, rx) = mpsc::channel::<Result<(Vec<ScannedFile>, String), Report>>();
         self.scanning_receiver = Some(rx);
         self.state = AppState::Scanning;
@@ -207,29 +199,23 @@ impl App {
 
         self.running = true;
         while self.running {
-            // Poll for key events.
             if event::poll(Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
-                        // Global key: Ctrl+S enters search/indexing mode.
                         if key.modifiers.contains(KeyModifiers::CONTROL)
                             && key.code == KeyCode::Char('s')
                         {
-                            self.enter_search_mode();
+                            self.enter_search_mode(terminal);
                         } else {
-                            self.handle_key(key);
+                            self.handle_key(key, terminal);
                         }
                     }
                 }
-            } else {
-                // Update spinner for animations.
-                if self.last_tick.elapsed() >= Duration::from_millis(100) {
-                    self.spinner_idx = (self.spinner_idx + 1) % self.spinner_chars.len();
-                    self.last_tick = Instant::now();
-                }
+            } else if self.last_tick.elapsed() >= Duration::from_millis(100) {
+                self.spinner_idx = (self.spinner_idx + 1) % self.spinner_chars.len();
+                self.last_tick = Instant::now();
             }
 
-            // Check if scanning has finished.
             if let Some(ref rx) = self.scanning_receiver {
                 match rx.try_recv() {
                     Ok(result) => {
@@ -250,7 +236,6 @@ impl App {
                 }
             }
 
-            // Check if indexing (for search) is complete.
             if let Some(ref rx) = self.indexing_receiver {
                 if rx.try_recv().is_ok() {
                     self.state = AppState::Search;
@@ -265,9 +250,13 @@ impl App {
         Ok(())
     }
 
-    fn handle_key(&mut self, key: KeyEvent) {
+    fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    ) {
         match self.state {
-            AppState::Search => self.handle_search_key(key),
+            AppState::Search => self.handle_search_key(key, terminal),
             _ => self.handle_default_key(key),
         }
     }
@@ -280,8 +269,12 @@ impl App {
         }
     }
 
-    /// When Ctrl+S is pressed, enter search mode by first building the search index.
-    fn enter_search_mode(&mut self) {
+    /// Enters search mode by building the search index first.
+    fn enter_search_mode(
+        &mut self,
+        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    ) {
+        let _ = terminal;
         self.state = AppState::Indexing;
         self.search_query.clear();
         self.search_results.clear();
@@ -289,7 +282,6 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         self.indexing_receiver = Some(rx);
 
-        // Clone data for the background thread.
         let scanned_files = self.scan_result.clone();
         let search_interface = self.search_interface.as_ref().unwrap().clone();
 
@@ -331,10 +323,20 @@ impl App {
         }
     }
 
-    fn handle_search_key(&mut self, key: KeyEvent) {
+    fn handle_search_key(
+        &mut self,
+        key: KeyEvent,
+        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    ) {
         match key.code {
             KeyCode::Esc => {
+                // Exit search mode and return to the preview.
                 self.state = AppState::Preview;
+            }
+            KeyCode::Enter => {
+                if let Some(doc) = self.search_results.get(self.selected_search_index) {
+                    open_file_in_editor(terminal, &doc.path);
+                }
             }
             KeyCode::Char(c) => {
                 self.search_query.push(c);
@@ -394,9 +396,6 @@ impl App {
         }
     }
 
-    /// Draws the search UI:
-    /// - Top: a text input for the search query.
-    /// - Bottom: split horizontally with the left column showing matched file paths and the right column showing a preview.
     fn draw_search_ui(&mut self, frame: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -432,7 +431,6 @@ impl App {
             List::new(items).block(Block::default().borders(Borders::ALL).title("Results"));
         frame.render_widget(results_list, bottom_chunks[0]);
 
-        // Use our highlight_markdown helper to process the document content.
         if let Some(doc) = self.search_results.get(self.selected_search_index) {
             let highlighted = highlight_markdown(&doc.content);
             let preview = Paragraph::new(highlighted)
@@ -448,4 +446,20 @@ impl App {
     fn quit(&mut self) {
         self.running = false;
     }
+}
+
+/// Opens the specified file in the default editor (from $EDITOR, fallback "vi").
+/// Temporarily restores the terminal, launches the editor, waits for exit,
+/// then reinitializes the terminal.
+fn open_file_in_editor(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    path: &str,
+) {
+    // Restore the terminal state.
+    ratatui::restore();
+    disable_raw_mode().expect("Failed to disable raw mode");
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let _ = std::process::Command::new(editor).arg(path).status();
+    // Reinitialize the terminal.
+    *terminal = ratatui::init();
 }
