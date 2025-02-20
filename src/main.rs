@@ -6,10 +6,10 @@ use color_eyre::Result;
 use notemancy_core::search::{MeiliSearchServer, SearchInterface};
 
 fn main() -> Result<()> {
-    // Install color-eyre for better error reporting.
+    // Install color-eyre for improved error reports.
     color_eyre::install()?;
 
-    // Start the MeiliSearch server, converting any error into a Report.
+    // Start the MeiliSearch server.
     let mut server = MeiliSearchServer::start().map_err(|e| Report::msg(e.to_string()))?;
     println!("MeiliSearch started on port {}", server.port);
 
@@ -20,7 +20,7 @@ fn main() -> Result<()> {
     // Initialize the terminal using ratatui's helper.
     let mut terminal = ratatui::init();
 
-    // Create your app and inject the search interface.
+    // Create the app and inject the search interface.
     let mut app = App::new();
     app.set_search_interface(search_interface);
 
@@ -30,7 +30,7 @@ fn main() -> Result<()> {
     // Restore the terminal state.
     ratatui::restore();
 
-    // Shutdown the MeiliSearch server, converting any error.
+    // Shutdown the MeiliSearch server.
     server.shutdown().map_err(|e| Report::msg(e.to_string()))?;
 
     result

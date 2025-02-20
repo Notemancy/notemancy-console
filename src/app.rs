@@ -15,8 +15,8 @@ use ratatui::{
 };
 use std::{
     path::PathBuf,
-    sync::mpsc::TryRecvError,
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, TryRecvError},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -25,7 +25,82 @@ use notemancy_core::scan::{ScannedFile, Scanner};
 // Import the search API types.
 use notemancy_core::search::{Document, SearchInterface};
 
-// We'll add a new state for indexing.
+use once_cell::sync::Lazy;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::SyntaxSet;
+
+static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(SyntaxSet::load_defaults_newlines);
+static THEME_SET: Lazy<ThemeSet> = Lazy::new(ThemeSet::load_defaults);
+
+fn highlight_markdown(content: &str) -> Vec<Line> {
+    use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag};
+    // Create a parser for the markdown content.
+    let parser = Parser::new(content);
+    let mut lines = Vec::new();
+    let mut in_code_block = false;
+    let mut code_lang = String::new();
+    let mut code_buffer = String::new();
+
+    for event in parser {
+        match event {
+            Event::Start(Tag::CodeBlock(info)) => {
+                in_code_block = true;
+                match info {
+                    CodeBlockKind::Fenced(lang) => {
+                        // Store the language as an owned string.
+                        code_lang = lang.to_string().to_owned();
+                    }
+                    CodeBlockKind::Indented => {
+                        code_lang.clear();
+                    }
+                }
+            }
+            Event::End(Tag::CodeBlock(_)) => {
+                // End of code block; perform highlighting.
+                let syntax = SYNTAX_SET
+                    .find_syntax_by_token(code_lang.as_str())
+                    .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text());
+                let theme = &THEME_SET.themes["base16-ocean.dark"];
+                let mut highlighter = HighlightLines::new(syntax, theme);
+                // Collect lines from code_buffer so that we don't borrow while clearing.
+                let code_lines: Vec<&str> = code_buffer.lines().collect();
+                for line in code_lines {
+                    let ranges = highlighter.highlight(line, &SYNTAX_SET);
+                    let spans: Vec<Span> = ranges
+                        .into_iter()
+                        .map(|(s, text)| {
+                            let fg = Color::Rgb(s.foreground.r, s.foreground.g, s.foreground.b);
+                            // Convert the text to an owned String.
+                            Span::styled(text.to_string(), Style::default().fg(fg))
+                        })
+                        .collect();
+                    lines.push(Line::from(spans));
+                }
+                code_buffer.clear();
+                in_code_block = false;
+            }
+            Event::Text(text) => {
+                if in_code_block {
+                    code_buffer.push_str(&text);
+                } else {
+                    // For normal text, split into lines and make them owned.
+                    for line in text.lines() {
+                        lines.push(Line::from(line.to_string()));
+                    }
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if !in_code_block {
+                    lines.push(Line::from(String::new()));
+                }
+            }
+            _ => {}
+        }
+    }
+    lines
+}
+
 #[derive(Debug, PartialEq)]
 enum AppState {
     Starting,
@@ -50,11 +125,11 @@ pub struct App {
     last_tick: Instant,
     // For search mode:
     search_query: String,
-    // Instead of strings, we store Documents so we can show file content.
+    // Instead of strings, we store Documents to show file content.
     search_results: Vec<Document>,
     selected_search_index: usize,
-    // We'll store the search interface (wrapped in Arc to allow sharing in threads).
-    search_interface: Option<std::sync::Arc<SearchInterface>>,
+    // Store the search interface.
+    search_interface: Option<Arc<SearchInterface>>,
     // Channel to signal that indexing is complete.
     indexing_receiver: IndexReceiver,
 }
@@ -79,6 +154,24 @@ impl Default for App {
     }
 }
 
+// Manually implement Debug for App, skipping non-Debug fields.
+impl std::fmt::Debug for App {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("App")
+            .field("running", &self.running)
+            .field("state", &self.state)
+            .field("spinner_idx", &self.spinner_idx)
+            .field("spinner_chars", &self.spinner_chars)
+            .field("scan_result", &self.scan_result)
+            .field("scan_summary", &self.scan_summary)
+            .field("last_tick", &self.last_tick)
+            .field("search_query", &self.search_query)
+            .field("search_results", &self.search_results)
+            .field("selected_search_index", &self.selected_search_index)
+            .finish()
+    }
+}
+
 impl App {
     pub fn new() -> Self {
         Self::default()
@@ -86,7 +179,7 @@ impl App {
 
     /// Setter so the app can use a preconfigured SearchInterface.
     pub fn set_search_interface(&mut self, si: SearchInterface) {
-        self.search_interface = Some(std::sync::Arc::new(si));
+        self.search_interface = Some(Arc::new(si));
     }
 
     pub fn run<B: ratatui::backend::Backend>(
@@ -129,7 +222,7 @@ impl App {
                     }
                 }
             } else {
-                // Update spinner for scanning/indexing animations.
+                // Update spinner for animations.
                 if self.last_tick.elapsed() >= Duration::from_millis(100) {
                     self.spinner_idx = (self.spinner_idx + 1) % self.spinner_chars.len();
                     self.last_tick = Instant::now();
@@ -189,17 +282,14 @@ impl App {
 
     /// When Ctrl+S is pressed, enter search mode by first building the search index.
     fn enter_search_mode(&mut self) {
-        // Transition to an indexing state so we can show an animation.
         self.state = AppState::Indexing;
         self.search_query.clear();
         self.search_results.clear();
         self.selected_search_index = 0;
-        // Create a channel to signal when indexing is complete.
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         self.indexing_receiver = Some(rx);
 
-        // Clone necessary data for the background thread.
-        // We assume that scan_result was populated from scanning.
+        // Clone data for the background thread.
         let scanned_files = self.scan_result.clone();
         let search_interface = self.search_interface.as_ref().unwrap().clone();
 
@@ -212,12 +302,11 @@ impl App {
                     eprintln!("Indexing error: {}", e);
                 }
             }
-            // Signal that indexing is complete.
             let _ = tx.send(());
         });
     }
 
-    /// Separates the search functionality into its own method.
+    /// Performs a search using the configured search interface.
     fn perform_search(&mut self) {
         if self.search_query.is_empty() {
             self.search_results.clear();
@@ -273,8 +362,7 @@ impl App {
         let area = frame.area();
         match self.state {
             AppState::Starting => {
-                let text = "notemancy is starting";
-                frame.render_widget(Paragraph::new(text), area);
+                frame.render_widget(Paragraph::new("notemancy is starting"), area);
             }
             AppState::Scanning => {
                 let spinner = self.spinner_chars[self.spinner_idx];
@@ -310,23 +398,20 @@ impl App {
     /// - Top: a text input for the search query.
     /// - Bottom: split horizontally with the left column showing matched file paths and the right column showing a preview.
     fn draw_search_ui(&mut self, frame: &mut Frame, area: Rect) {
-        // Divide the area vertically: top (3 lines) for input, bottom for results.
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
             .split(area);
 
-        let input = Paragraph::new::<&str>(self.search_query.as_str())
+        let input = Paragraph::new(self.search_query.as_str())
             .block(Block::default().borders(Borders::ALL).title("Search"));
         frame.render_widget(input, chunks[0]);
 
-        // Divide the lower area horizontally.
         let bottom_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(30), Constraint::Percentage(70)].as_ref())
             .split(chunks[1]);
 
-        // Build a list of results (using each document's path).
         let items: Vec<ListItem> = self
             .search_results
             .iter()
@@ -347,15 +432,17 @@ impl App {
             List::new(items).block(Block::default().borders(Borders::ALL).title("Results"));
         frame.render_widget(results_list, bottom_chunks[0]);
 
-        // Show preview: display the content of the selected document.
-        let preview_text = if let Some(doc) = self.search_results.get(self.selected_search_index) {
-            format!("Preview:\n{}", doc.content)
+        // Use our highlight_markdown helper to process the document content.
+        if let Some(doc) = self.search_results.get(self.selected_search_index) {
+            let highlighted = highlight_markdown(&doc.content);
+            let preview = Paragraph::new(highlighted)
+                .block(Block::default().borders(Borders::ALL).title("Preview"));
+            frame.render_widget(preview, bottom_chunks[1]);
         } else {
-            "No file selected.".into()
-        };
-        let preview = Paragraph::new(preview_text)
-            .block(Block::default().borders(Borders::ALL).title("Preview"));
-        frame.render_widget(preview, bottom_chunks[1]);
+            let preview = Paragraph::new("No file selected.")
+                .block(Block::default().borders(Borders::ALL).title("Preview"));
+            frame.render_widget(preview, bottom_chunks[1]);
+        }
     }
 
     fn quit(&mut self) {
