@@ -1,3 +1,4 @@
+use crate::config_editor;
 use color_eyre::eyre::Report;
 use color_eyre::Result;
 
@@ -237,6 +238,15 @@ impl App {
                             && key.code == KeyCode::Char('s')
                         {
                             self.enter_search_mode(terminal);
+                        } else if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.code == KeyCode::Char('e')
+                        {
+                            // Launch the config editor via our new module.
+                            if let Err(e) = config_editor::open_config_in_editor(terminal) {
+                                eprintln!("Error opening config: {}", e);
+                            }
+                            // Optionally, continue immediately after launching the editor.
+                            continue;
                         } else {
                             self.handle_key(key, terminal);
                         }

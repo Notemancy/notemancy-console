@@ -1,5 +1,6 @@
 pub use app::App;
 pub mod app;
+pub mod config_editor;
 
 use color_eyre::eyre::Report;
 use color_eyre::Result;
