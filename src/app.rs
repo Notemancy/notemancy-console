@@ -136,6 +136,19 @@ enum AppState {
     Preview,
     Indexing,
     Search,
+    CommandPalette, // New state for command palette
+}
+
+// 2. Define a type for command actions and a CommandItem struct:
+type CommandAction = Box<
+    dyn Fn(&mut App, &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>)
+        + Send,
+>;
+
+struct CommandItem {
+    name: &'static str,
+    description: &'static str,
+    action: CommandAction,
 }
 
 type ScanReceiver = Option<Receiver<Result<(Vec<ScannedFile>, String), Report>>>;
@@ -157,6 +170,9 @@ pub struct App {
     // Store the search interface.
     search_interface: Option<Arc<SearchInterface>>,
     indexing_receiver: IndexReceiver,
+    // New fields for the command palette:
+    command_items: Vec<CommandItem>,
+    selected_command_index: usize,
 }
 
 impl Default for App {
@@ -175,6 +191,8 @@ impl Default for App {
             selected_search_index: 0,
             search_interface: None,
             indexing_receiver: None,
+            command_items: Vec::new(),
+            selected_command_index: 0,
         }
     }
 }
@@ -205,6 +223,42 @@ impl App {
     /// Setter for injecting a preconfigured SearchInterface.
     pub fn set_search_interface(&mut self, si: SearchInterface) {
         self.search_interface = Some(Arc::new(si));
+    }
+
+    fn enter_command_palette(&mut self) {
+        // Populate with your available commands.
+        // For example, we include Search, Open Config Editor, and Quit.
+        self.command_items = vec![
+            CommandItem {
+                name: "Search",
+                description: "Enter search mode",
+                action: Box::new(|app, terminal| {
+                    // Reuse your existing search mode; note that you may want
+                    // additional logic if needed.
+                    app.enter_search_mode(terminal);
+                    app.state = AppState::Preview;
+                }),
+            },
+            CommandItem {
+                name: "Open Config Editor",
+                description: "Edit configuration file",
+                action: Box::new(|app, terminal| {
+                    if let Err(e) = config_editor::open_config_in_editor(terminal) {
+                        eprintln!("Error opening config: {}", e);
+                    }
+                    app.state = AppState::Preview;
+                }),
+            },
+            CommandItem {
+                name: "Quit",
+                description: "Exit the application",
+                action: Box::new(|app, _terminal| {
+                    app.quit();
+                }),
+            },
+        ];
+        self.selected_command_index = 0;
+        self.state = AppState::CommandPalette;
     }
 
     pub fn run(
@@ -298,6 +352,7 @@ impl App {
     ) {
         match self.state {
             AppState::Search => self.handle_search_key(key, terminal),
+            AppState::CommandPalette => self.handle_command_palette_key(key, terminal),
             _ => self.handle_default_key(key),
         }
     }
@@ -306,8 +361,115 @@ impl App {
         match (key.modifiers, key.code) {
             (_, KeyCode::Esc | KeyCode::Char('q'))
             | (KeyModifiers::CONTROL, KeyCode::Char('c') | KeyCode::Char('C')) => self.quit(),
+            // New shortcut: Ctrl+P opens the command palette.
+            (KeyModifiers::CONTROL, KeyCode::Char('p')) => self.enter_command_palette(),
             _ => {}
         }
+    }
+
+    fn handle_command_palette_key(
+        &mut self,
+        key: KeyEvent,
+        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
+    ) {
+        match key.code {
+            KeyCode::Esc => {
+                self.state = AppState::Preview;
+            }
+            KeyCode::Up => {
+                if self.selected_command_index > 0 {
+                    self.selected_command_index -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if self.selected_command_index + 1 < self.command_items.len() {
+                    self.selected_command_index += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(cmd) = self.command_items.get(self.selected_command_index) {
+                    // Extract a raw pointer to the action closure.
+                    let action_ptr: *const Box<
+                        dyn Fn(
+                                &mut App,
+                                &mut ratatui::Terminal<ratatui::prelude::CrosstermBackend<Stdout>>,
+                            ) + Send,
+                    > = &cmd.action as *const _;
+                    // Now, call the closure using an unsafe block.
+                    unsafe {
+                        (*action_ptr)(self, terminal);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn centered_rect(
+        percent_x: u16,
+        percent_y: u16,
+        r: ratatui::layout::Rect,
+    ) -> ratatui::layout::Rect {
+        use ratatui::layout::{Constraint, Direction, Layout};
+        let popup_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(
+                [
+                    Constraint::Percentage((100 - percent_y) / 2),
+                    Constraint::Percentage(percent_y),
+                    Constraint::Percentage((100 - percent_y) / 2),
+                ]
+                .as_ref(),
+            )
+            .split(r);
+        let vertical_chunk = popup_layout[1];
+        let horizontal_layout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(
+                [
+                    Constraint::Percentage((100 - percent_x) / 2),
+                    Constraint::Percentage(percent_x),
+                    Constraint::Percentage((100 - percent_x) / 2),
+                ]
+                .as_ref(),
+            )
+            .split(vertical_chunk);
+        horizontal_layout[1]
+    }
+
+    // 8. Draw the command palette.
+    fn draw_command_palette(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::text::Span;
+        use ratatui::widgets::{Block, Borders, List, ListItem};
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Command Palette")
+            .border_style(Style::default().fg(Color::Cyan));
+
+        let inner_area = Self::centered_rect(60, 30, area);
+
+        let items: Vec<ListItem> = self
+            .command_items
+            .iter()
+            .enumerate()
+            .map(|(i, cmd)| {
+                let style = if i == self.selected_command_index {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let content = format!("{} - {}", cmd.name, cmd.description);
+                ListItem::new(Span::styled(content, style))
+            })
+            .collect();
+
+        let list = List::new(items).block(block);
+        frame.render_widget(list, inner_area);
     }
 
     fn enter_search_mode(
@@ -399,11 +561,11 @@ impl App {
         }
     }
 
-    fn draw(&mut self, frame: &mut Frame) {
+    fn draw(&mut self, frame: &mut ratatui::Frame) {
         let area = frame.area();
         match self.state {
             AppState::Starting => {
-                let paragraph = Paragraph::new("notemancy is starting")
+                let paragraph = ratatui::widgets::Paragraph::new("notemancy is starting")
                     .style(
                         Style::default()
                             .fg(Color::Rgb(224, 224, 224))
@@ -415,7 +577,7 @@ impl App {
             AppState::Scanning => {
                 let spinner = self.spinner_chars[self.spinner_idx];
                 let text = format!("Scanning... {}", spinner);
-                let paragraph = Paragraph::new(text)
+                let paragraph = ratatui::widgets::Paragraph::new(text)
                     .style(
                         Style::default()
                             .fg(Color::Rgb(224, 224, 224))
@@ -427,7 +589,7 @@ impl App {
             AppState::Indexing => {
                 let spinner = self.spinner_chars[self.spinner_idx];
                 let text = format!("Building search index... {}", spinner);
-                let paragraph = Paragraph::new(text)
+                let paragraph = ratatui::widgets::Paragraph::new(text)
                     .style(
                         Style::default()
                             .fg(Color::Rgb(224, 224, 224))
@@ -437,8 +599,8 @@ impl App {
                 frame.render_widget(paragraph, area);
             }
             AppState::Preview => {
-                let text = "Hello, Ratatui!\n\nCreated using https://github.com/ratatui/templates\nPress Ctrl+S to search.\nPress Esc, Ctrl-C or q to stop running.";
-                let paragraph = Paragraph::new(text)
+                let text = "Hello, Ratatui!\n\nCreated using https://github.com/ratatui/templates\nPress Ctrl+S to search.\nPress Ctrl+P for commands.\nPress Esc, Ctrl-C or q to quit.";
+                let paragraph = ratatui::widgets::Paragraph::new(text)
                     .style(
                         Style::default()
                             .fg(Color::Rgb(224, 224, 224))
@@ -448,7 +610,12 @@ impl App {
                     .block(Block::default());
                 frame.render_widget(paragraph, area);
             }
-            AppState::Search => self.draw_search_ui(frame, area),
+            AppState::Search => {
+                self.draw_search_ui(frame, area);
+            }
+            AppState::CommandPalette => {
+                self.draw_command_palette(frame, area);
+            }
         }
     }
 
