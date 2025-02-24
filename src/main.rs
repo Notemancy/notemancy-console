@@ -1,7 +1,7 @@
-pub use app::App;
 pub mod app;
 pub mod config_editor;
 
+use app::core::App;
 use color_eyre::eyre::Report;
 use color_eyre::Result;
 use notemancy_core::search::{MeiliSearchServer, SearchInterface};

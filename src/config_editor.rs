@@ -1,25 +1,32 @@
-// src/config_editor.rs
-
 use color_eyre::Result;
 use crossterm::terminal::disable_raw_mode;
 use notemancy_core::config;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::Stdout;
 
-/// Opens the configuration file in the default editor defined by the SHELL.
-/// It restores the terminal, calls the notemancy_core config API to open the config,
-/// then reinitializes the TUI terminal.
-pub fn open_config_in_editor(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-    // Restore the terminal so the editor can take over.
+/// Opens an arbitrary file in the default editor (using $EDITOR or "vi").
+/// It restores the terminal, launches the editor for the given path, then reinitializes the terminal.
+pub fn open_file_in_editor(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    path: &str,
+) -> Result<()> {
+    // Restore terminal state so the editor can work.
     ratatui::restore();
     disable_raw_mode()?;
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let _ = std::process::Command::new(editor).arg(path).status();
+    // Reinitialize terminal.
+    *terminal = ratatui::init();
+    Ok(())
+}
 
-    // Use the config module from notemancy-core.
+/// (Your existing open_config_in_editor remains unchanged.)
+pub fn open_config_in_editor(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    ratatui::restore();
+    disable_raw_mode()?;
     if let Err(e) = config::open_config_in_editor() {
         eprintln!("Error opening config: {}", e);
     }
-
-    // Reinitialize the terminal.
     *terminal = ratatui::init();
     Ok(())
 }
