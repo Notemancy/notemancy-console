@@ -5,15 +5,17 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
-use ratatui::prelude::Stylize;
+use pulldown_cmark::{CodeBlockKind, Event as MdEvent, Parser, Tag};
+use ratatui::widgets::Padding;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, List, ListItem, Paragraph},
     Frame,
 };
 use std::{
+    io::Stdout,
     path::PathBuf,
     sync::mpsc::{self, Receiver, TryRecvError},
     sync::Arc,
@@ -26,7 +28,6 @@ use notemancy_core::scan::{ScannedFile, Scanner};
 use notemancy_core::search::{Document, SearchInterface};
 
 use once_cell::sync::Lazy;
-use pulldown_cmark::{CodeBlockKind, Event as MdEvent, Parser, Tag};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
@@ -34,64 +35,95 @@ use syntect::parsing::SyntaxSet;
 static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: Lazy<ThemeSet> = Lazy::new(ThemeSet::load_defaults);
 
-fn highlight_markdown(content: &str) -> Vec<Line> {
+fn highlight_markdown(content: &str) -> Vec<ratatui::text::Line<'static>> {
+    use pulldown_cmark::{CodeBlockKind, Event as MdEvent, Parser, Tag};
     let parser = Parser::new(content);
     let mut lines = Vec::new();
+    let mut current_line = String::new();
     let mut in_code_block = false;
     let mut code_lang = String::new();
     let mut code_buffer = String::new();
 
     for event in parser {
         match event {
-            MdEvent::Start(Tag::CodeBlock(info)) => {
-                in_code_block = true;
-                match info {
-                    CodeBlockKind::Fenced(lang) => {
-                        code_lang = lang.to_string().to_owned();
+            MdEvent::Start(tag) => match tag {
+                Tag::CodeBlock(info) => {
+                    // Flush any pending normal text.
+                    if !current_line.is_empty() {
+                        lines.push(ratatui::text::Line::from(current_line.clone()));
+                        current_line.clear();
                     }
-                    CodeBlockKind::Indented => {
-                        code_lang.clear();
+                    in_code_block = true;
+                    match info {
+                        CodeBlockKind::Fenced(lang) => {
+                            code_lang = lang.to_string().to_owned();
+                        }
+                        CodeBlockKind::Indented => {
+                            code_lang.clear();
+                        }
                     }
                 }
-            }
-            MdEvent::End(Tag::CodeBlock(_)) => {
-                let syntax = SYNTAX_SET
-                    .find_syntax_by_token(code_lang.as_str())
-                    .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text());
-                let theme = &THEME_SET.themes["base16-ocean.dark"];
-                let mut highlighter = HighlightLines::new(syntax, theme);
-                // Collect lines so we don't hold a borrow on code_buffer.
-                let code_lines: Vec<&str> = code_buffer.lines().collect();
-                for line in code_lines {
-                    let ranges = highlighter.highlight(line, &SYNTAX_SET);
-                    let spans: Vec<Span> = ranges
-                        .into_iter()
-                        .map(|(s, text)| {
-                            let fg = Color::Rgb(s.foreground.r, s.foreground.g, s.foreground.b);
-                            Span::styled(text.to_string(), Style::default().fg(fg))
-                        })
-                        .collect();
-                    lines.push(Line::from(spans));
+                Tag::Heading(level, ..) => {
+                    // For headings, prepend the appropriate number of '#' characters.
+                    current_line.push_str(&"#".repeat(level as usize));
+                    current_line.push(' ');
                 }
-                code_buffer.clear();
-                in_code_block = false;
-            }
+                _ => {}
+            },
+            MdEvent::End(tag) => match tag {
+                Tag::CodeBlock(_) => {
+                    // Process the accumulated code block.
+                    let syntax = SYNTAX_SET
+                        .find_syntax_by_token(code_lang.as_str())
+                        .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text());
+                    let theme = &THEME_SET.themes["base16-ocean.dark"];
+                    let mut highlighter = HighlightLines::new(syntax, theme);
+                    let code_lines: Vec<&str> = code_buffer.lines().collect();
+                    for line in code_lines {
+                        let ranges = highlighter.highlight(line, &SYNTAX_SET);
+                        let spans: Vec<ratatui::text::Span> = ranges
+                            .into_iter()
+                            .map(|(s, text)| {
+                                let fg = Color::Rgb(s.foreground.r, s.foreground.g, s.foreground.b);
+                                ratatui::text::Span::styled(
+                                    text.to_string(),
+                                    Style::default().fg(fg),
+                                )
+                            })
+                            .collect();
+                        lines.push(ratatui::text::Line::from(spans));
+                    }
+                    code_buffer.clear();
+                    in_code_block = false;
+                }
+                Tag::Heading(..) => {
+                    // End of a heading: flush the current line.
+                    lines.push(ratatui::text::Line::from(current_line.clone()));
+                    current_line.clear();
+                }
+                _ => {}
+            },
             MdEvent::Text(text) => {
                 if in_code_block {
                     code_buffer.push_str(&text);
                 } else {
-                    for line in text.lines() {
-                        lines.push(Line::from(line.to_string()));
-                    }
+                    current_line.push_str(&text);
                 }
             }
             MdEvent::SoftBreak | MdEvent::HardBreak => {
-                if !in_code_block {
-                    lines.push(Line::from(String::new()));
+                if in_code_block {
+                    code_buffer.push('\n');
+                } else {
+                    current_line.push('\n');
+                    lines.push(ratatui::text::Line::from(current_line.clone()));
+                    current_line.clear();
                 }
             }
             _ => {}
         }
+    }
+    if !current_line.is_empty() {
+        lines.push(ratatui::text::Line::from(current_line));
     }
     lines
 }
@@ -146,7 +178,7 @@ impl Default for App {
     }
 }
 
-// Manually implement Debug for App, skipping non-Debug fields.
+// Manually implement Debug for App, skipping search_interface.
 impl std::fmt::Debug for App {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("App")
@@ -169,15 +201,14 @@ impl App {
         Self::default()
     }
 
-    /// Setter so the app can use a preconfigured SearchInterface.
+    /// Setter for injecting a preconfigured SearchInterface.
     pub fn set_search_interface(&mut self, si: SearchInterface) {
         self.search_interface = Some(Arc::new(si));
     }
 
-    // Notice the terminal type is now fixed:
     pub fn run(
         mut self,
-        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     ) -> Result<()> {
         enable_raw_mode()?;
         println!("notemancy is starting");
@@ -253,7 +284,7 @@ impl App {
     fn handle_key(
         &mut self,
         key: KeyEvent,
-        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     ) {
         match self.state {
             AppState::Search => self.handle_search_key(key, terminal),
@@ -269,10 +300,9 @@ impl App {
         }
     }
 
-    /// Enters search mode by building the search index first.
     fn enter_search_mode(
         &mut self,
-        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     ) {
         let _ = terminal;
         self.state = AppState::Indexing;
@@ -298,7 +328,6 @@ impl App {
         });
     }
 
-    /// Performs a search using the configured search interface.
     fn perform_search(&mut self) {
         if self.search_query.is_empty() {
             self.search_results.clear();
@@ -326,16 +355,16 @@ impl App {
     fn handle_search_key(
         &mut self,
         key: KeyEvent,
-        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     ) {
         match key.code {
             KeyCode::Esc => {
-                // Exit search mode and return to the preview.
                 self.state = AppState::Preview;
             }
             KeyCode::Enter => {
                 if let Some(doc) = self.search_results.get(self.selected_search_index) {
                     open_file_in_editor(terminal, &doc.path);
+                    self.state = AppState::Preview;
                 }
             }
             KeyCode::Char(c) => {
@@ -364,46 +393,69 @@ impl App {
         let area = frame.area();
         match self.state {
             AppState::Starting => {
-                frame.render_widget(Paragraph::new("notemancy is starting"), area);
+                let paragraph = Paragraph::new("notemancy is starting")
+                    .style(
+                        Style::default()
+                            .fg(Color::Rgb(224, 224, 224))
+                            .bg(Color::Rgb(22, 22, 22)),
+                    )
+                    .block(Block::default());
+                frame.render_widget(paragraph, area);
             }
             AppState::Scanning => {
                 let spinner = self.spinner_chars[self.spinner_idx];
                 let text = format!("Scanning... {}", spinner);
-                frame.render_widget(Paragraph::new(text), area);
+                let paragraph = Paragraph::new(text)
+                    .style(
+                        Style::default()
+                            .fg(Color::Rgb(224, 224, 224))
+                            .bg(Color::Rgb(22, 22, 22)),
+                    )
+                    .block(Block::default());
+                frame.render_widget(paragraph, area);
             }
             AppState::Indexing => {
                 let spinner = self.spinner_chars[self.spinner_idx];
                 let text = format!("Building search index... {}", spinner);
-                frame.render_widget(Paragraph::new(text), area);
+                let paragraph = Paragraph::new(text)
+                    .style(
+                        Style::default()
+                            .fg(Color::Rgb(224, 224, 224))
+                            .bg(Color::Rgb(22, 22, 22)),
+                    )
+                    .block(Block::default());
+                frame.render_widget(paragraph, area);
             }
             AppState::Preview => {
-                let title = Line::from("Ratatui Simple Template")
-                    .bold()
-                    .blue()
-                    .centered();
-                let text = "Hello, Ratatui!\n\n\
-                            Created using https://github.com/ratatui/templates\n\
-                            Press Ctrl+S to search.\n\
-                            Press `Esc`, `Ctrl-C` or `q` to stop running.";
-                frame.render_widget(
-                    Paragraph::new(text)
-                        .block(Block::default().borders(Borders::ALL).title(title))
-                        .centered(),
-                    area,
-                );
+                let text = "Hello, Ratatui!\n\nCreated using https://github.com/ratatui/templates\nPress Ctrl+S to search.\nPress Esc, Ctrl-C or q to stop running.";
+                let paragraph = Paragraph::new(text)
+                    .style(
+                        Style::default()
+                            .fg(Color::Rgb(224, 224, 224))
+                            .bg(Color::Rgb(22, 22, 22)),
+                    )
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .block(Block::default());
+                frame.render_widget(paragraph, area);
             }
             AppState::Search => self.draw_search_ui(frame, area),
         }
     }
 
     fn draw_search_ui(&mut self, frame: &mut Frame, area: Rect) {
+        // Use a smaller top chunk (2 rows instead of 3) for the input.
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
+            .constraints([Constraint::Length(1), Constraint::Min(0)].as_ref())
             .split(area);
 
-        let input = Paragraph::new(self.search_query.as_str())
-            .block(Block::default().borders(Borders::ALL).title("Search"));
+        // Search input: apply internal padding by wrapping the text in spaces.
+        let padded_input = format!(" {} ", self.search_query);
+        let input = Line::from(padded_input).style(
+            Style::default()
+                .fg(Color::Rgb(69, 137, 255))
+                .bg(Color::Rgb(30, 30, 30)),
+        );
         frame.render_widget(input, chunks[0]);
 
         let bottom_chunks = Layout::default()
@@ -417,28 +469,57 @@ impl App {
             .enumerate()
             .map(|(i, doc)| {
                 let style = if i == self.selected_search_index {
+                    // Use blue background for the selected item.
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(Color::Rgb(224, 224, 224))
+                        .bg(Color::Rgb(70, 130, 180)) // steel blue
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
+                        .fg(Color::Rgb(198, 198, 198))
+                        .bg(Color::Rgb(22, 22, 22))
                 };
-                ListItem::new(Span::styled(&doc.path, style))
+                ListItem::new(Span::styled(format!(" {} ", &doc.path), style))
             })
             .collect();
 
-        let results_list =
-            List::new(items).block(Block::default().borders(Borders::ALL).title("Results"));
+        let results_list = List::new(items).style(Style::default().bg(Color::Rgb(22, 22, 22)));
         frame.render_widget(results_list, bottom_chunks[0]);
 
         if let Some(doc) = self.search_results.get(self.selected_search_index) {
-            let highlighted = highlight_markdown(&doc.content);
+            let mut highlighted = highlight_full_markdown(&doc.content);
+            // Overlay match highlighting if needed.
+            if !self.search_query.is_empty() {
+                highlighted = highlighted
+                    .into_iter()
+                    .map(|line| highlight_matches(&line, &self.search_query))
+                    .collect();
+            }
+            // Insert extra spacing to simulate 1.5 line height.
+            // let spaced_highlighted = add_line_spacing(highlighted);
+            let preview_block = ratatui::widgets::Block::default().padding(Padding {
+                left: (2),
+                right: (2),
+                top: (1),
+                bottom: (1),
+            });
             let preview = Paragraph::new(highlighted)
-                .block(Block::default().borders(Borders::ALL).title("Preview"));
+                .style(
+                    Style::default()
+                        .fg(Color::Rgb(224, 224, 224))
+                        .bg(Color::Rgb(38, 38, 38)),
+                )
+                .alignment(ratatui::layout::Alignment::Left)
+                .block(preview_block);
             frame.render_widget(preview, bottom_chunks[1]);
         } else {
             let preview = Paragraph::new("No file selected.")
-                .block(Block::default().borders(Borders::ALL).title("Preview"));
+                .style(
+                    Style::default()
+                        .fg(Color::Rgb(224, 224, 224))
+                        .bg(Color::Rgb(38, 38, 38)),
+                )
+                .alignment(ratatui::layout::Alignment::Left);
             frame.render_widget(preview, bottom_chunks[1]);
         }
     }
@@ -448,18 +529,168 @@ impl App {
     }
 }
 
-/// Opens the specified file in the default editor (from $EDITOR, fallback "vi").
-/// Temporarily restores the terminal, launches the editor, waits for exit,
-/// then reinitializes the terminal.
+/// Opens the specified file in the default editor (using $EDITOR or "vi").
+/// Restores the terminal, launches the editor, waits for it to exit, then reinitializes the terminal.
 fn open_file_in_editor(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     path: &str,
 ) {
-    // Restore the terminal state.
     ratatui::restore();
-    disable_raw_mode().expect("Failed to disable raw mode");
+    crossterm::terminal::disable_raw_mode().expect("Failed to disable raw mode");
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
     let _ = std::process::Command::new(editor).arg(path).status();
-    // Reinitialize the terminal.
     *terminal = ratatui::init();
+}
+
+fn highlight_matches(line: &ratatui::text::Line, query: &str) -> ratatui::text::Line<'static> {
+    let mut new_spans = Vec::new();
+    // Iterate over the spans in the line.
+    for span in &line.spans {
+        // Convert the span content to an owned String.
+        let text = span.content.to_string();
+        let mut start = 0;
+        let text_lower = text.to_lowercase();
+        let query_lower = query.to_lowercase();
+        while let Some(pos) = text_lower[start..].find(&query_lower) {
+            let pos = start + pos;
+            if pos > start {
+                new_spans.push(ratatui::text::Span::styled(
+                    text[start..pos].to_string(),
+                    span.style,
+                ));
+            }
+            new_spans.push(ratatui::text::Span::styled(
+                text[pos..pos + query.len()].to_string(),
+                ratatui::style::Style::default()
+                    .fg(ratatui::style::Color::Black)
+                    .bg(ratatui::style::Color::Yellow),
+            ));
+            start = pos + query.len();
+        }
+        if start < text.len() {
+            new_spans.push(ratatui::text::Span::styled(
+                text[start..].to_string(),
+                span.style,
+            ));
+        }
+    }
+    ratatui::text::Line::from(new_spans)
+}
+
+fn highlight_full_markdown(content: &str) -> Vec<Line<'static>> {
+    let parser = Parser::new(content);
+    let mut lines = Vec::new();
+    let mut current_spans = Vec::new();
+
+    // For code block processing
+    let mut in_code_block = false;
+    let mut code_lang = String::new();
+    let mut code_buffer = String::new();
+
+    for event in parser {
+        match event {
+            MdEvent::Start(tag) => match tag {
+                Tag::CodeBlock(info) => {
+                    in_code_block = true;
+                    match info {
+                        CodeBlockKind::Fenced(lang) => {
+                            code_lang = lang.to_string().to_owned();
+                        }
+                        CodeBlockKind::Indented => {
+                            code_lang.clear();
+                        }
+                    }
+                }
+                Tag::Heading(level, ..) => {
+                    // Prepend heading markers styled in blue and bold.
+                    let markers = format!("{} ", "#".repeat(level as usize));
+                    current_spans.push(Span::styled(
+                        markers,
+                        Style::default()
+                            .fg(Color::Rgb(69, 137, 255))
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                Tag::List(_) => {
+                    // Prepend a bullet for list items.
+                    current_spans.push(Span::styled(
+                        "• ",
+                        Style::default().fg(Color::Rgb(69, 137, 255)),
+                    ));
+                }
+                // You can add additional styling for Emphasis, Strong, etc. here.
+                _ => {}
+            },
+            MdEvent::End(tag) => match tag {
+                Tag::CodeBlock(_) => {
+                    // Process code block using your existing syntect approach.
+                    use once_cell::sync::Lazy;
+                    use syntect::easy::HighlightLines;
+                    use syntect::highlighting::ThemeSet;
+                    use syntect::parsing::SyntaxSet;
+                    static SYNTAX_SET: Lazy<SyntaxSet> =
+                        Lazy::new(|| SyntaxSet::load_defaults_newlines());
+                    static THEME_SET: Lazy<ThemeSet> = Lazy::new(|| ThemeSet::load_defaults());
+                    let syntax = SYNTAX_SET
+                        .find_syntax_by_token(code_lang.as_str())
+                        .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text());
+                    let theme = &THEME_SET.themes["base16-ocean.dark"];
+                    let mut highlighter = HighlightLines::new(syntax, theme);
+                    // Process each line in the code block.
+                    for line in code_buffer.lines() {
+                        let ranges = highlighter.highlight(line, &SYNTAX_SET);
+                        let spans: Vec<Span> = ranges
+                            .into_iter()
+                            .map(|(s, text)| {
+                                let fg = Color::Rgb(s.foreground.r, s.foreground.g, s.foreground.b);
+                                Span::styled(text.to_string(), Style::default().fg(fg))
+                            })
+                            .collect();
+                        lines.push(Line::from(spans));
+                    }
+                    code_buffer.clear();
+                    in_code_block = false;
+                }
+                Tag::Heading(..) | Tag::List(_) | Tag::Paragraph => {
+                    // End of a block: flush current spans as a new line.
+                    if !current_spans.is_empty() {
+                        lines.push(Line::from(current_spans));
+                        current_spans = Vec::new();
+                    }
+                }
+                _ => {}
+            },
+            MdEvent::Text(text) => {
+                if in_code_block {
+                    code_buffer.push_str(&text);
+                } else {
+                    current_spans.push(Span::raw(text.to_string()));
+                }
+            }
+            MdEvent::SoftBreak | MdEvent::HardBreak => {
+                if in_code_block {
+                    code_buffer.push('\n');
+                } else {
+                    // End the current line.
+                    lines.push(Line::from(current_spans));
+                    current_spans = Vec::new();
+                }
+            }
+            _ => {}
+        }
+    }
+    if !current_spans.is_empty() {
+        lines.push(Line::from(current_spans));
+    }
+    lines
+}
+
+fn add_line_spacing(lines: Vec<ratatui::text::Line<'static>>) -> Vec<ratatui::text::Line<'static>> {
+    let mut spaced = Vec::new();
+    for line in lines {
+        spaced.push(line);
+        // Insert an empty line (or a line with a single space) after every line.
+        spaced.push(ratatui::text::Line::from(" "));
+    }
+    spaced
 }
