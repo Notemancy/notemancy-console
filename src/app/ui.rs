@@ -8,6 +8,7 @@ use ratatui::{
 
 use crate::app::core::App;
 use crate::app::highlight::{highlight_full_markdown, highlight_matches};
+use std::fs;
 
 pub fn draw_search_ui(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
@@ -33,7 +34,7 @@ pub fn draw_search_ui(app: &mut App, frame: &mut Frame) {
         .search_results
         .iter()
         .enumerate()
-        .map(|(i, doc)| {
+        .map(|(i, result)| {
             let style = if i == app.selected_search_index {
                 // Use blue background for the selected item.
                 Style::default()
@@ -45,15 +46,36 @@ pub fn draw_search_ui(app: &mut App, frame: &mut Frame) {
                     .fg(Color::Rgb(198, 198, 198))
                     .bg(Color::Rgb(22, 22, 22))
             };
-            ListItem::new(Span::styled(format!(" {} ", &doc.path), style))
+
+            // Display title (if available) or just the filename
+            let display_text = if result.title.is_empty() {
+                // Extract filename from path if no title
+                let path = std::path::Path::new(&result.path);
+                path.file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or(&result.path)
+                    .to_string()
+            } else {
+                result.title.clone()
+            };
+
+            ListItem::new(Span::styled(format!(" {} ", display_text), style))
         })
         .collect();
 
     let results_list = List::new(items).style(Style::default().bg(Color::Rgb(22, 22, 22)));
     frame.render_widget(results_list, bottom_chunks[0]);
 
-    if let Some(doc) = app.search_results.get(app.selected_search_index) {
-        let mut highlighted = highlight_full_markdown(&doc.content);
+    if let Some(result) = app.search_results.get(app.selected_search_index) {
+        // Read the content of the selected file
+        let content = match fs::read_to_string(&result.path) {
+            Ok(content) => content,
+            Err(e) => {
+                format!("Error reading file: {}", e)
+            }
+        };
+
+        let mut highlighted = highlight_full_markdown(&content);
         // Overlay match highlighting if needed.
         if !app.search_query.is_empty() {
             highlighted = highlighted
@@ -61,14 +83,14 @@ pub fn draw_search_ui(app: &mut App, frame: &mut Frame) {
                 .map(|line| highlight_matches(&line, &app.search_query))
                 .collect();
         }
-        // Insert extra spacing to simulate 1.5 line height.
-        // let spaced_highlighted = add_line_spacing(highlighted);
+
         let preview_block = ratatui::widgets::Block::default().padding(Padding {
             left: (2),
             right: (2),
             top: (1),
             bottom: (1),
         });
+
         let preview = Paragraph::new(highlighted)
             .style(
                 Style::default()
@@ -77,6 +99,7 @@ pub fn draw_search_ui(app: &mut App, frame: &mut Frame) {
             )
             .alignment(ratatui::layout::Alignment::Left)
             .block(preview_block);
+
         frame.render_widget(preview, bottom_chunks[1]);
     } else {
         let preview = Paragraph::new("No file selected.")

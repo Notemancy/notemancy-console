@@ -10,7 +10,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 use notemancy_core::scan::{ScannedFile, Scanner};
-use notemancy_core::search::{Document, SearchInterface};
+use notemancy_core::search::{SearchEngine, SearchResult};
 use ratatui::style::{Color, Style};
 use std::{
     io::Stdout,
@@ -44,10 +44,10 @@ pub struct App {
     pub last_tick: Instant,
     // For search mode:
     pub search_query: String,
-    pub search_results: Vec<Document>,
+    pub search_results: Vec<SearchResult>,
     pub selected_search_index: usize,
     // Store the search interface.
-    pub search_interface: Option<Arc<SearchInterface>>,
+    pub search_engine: Option<SearchEngine>,
     pub indexing_receiver: IndexReceiver,
     // Command palette fields:
     pub command_items: Vec<CommandItem>,
@@ -68,7 +68,7 @@ impl Default for App {
             search_query: String::new(),
             search_results: Vec::new(),
             selected_search_index: 0,
-            search_interface: None,
+            search_engine: None,
             indexing_receiver: None,
             command_items: Vec::new(),
             selected_command_index: 0,
@@ -81,9 +81,8 @@ impl App {
         Self::default()
     }
 
-    /// Setter for injecting a preconfigured SearchInterface.
-    pub fn set_search_interface(&mut self, si: SearchInterface) {
-        self.search_interface = Some(Arc::new(si));
+    pub fn set_search_engine(&mut self, engine: SearchEngine) {
+        self.search_engine = Some(engine);
     }
 
     pub fn enter_command_palette(&mut self) {
@@ -242,21 +241,31 @@ impl App {
         self.search_query.clear();
         self.search_results.clear();
         self.selected_search_index = 0;
+
+        // Create a channel to communicate when indexing is done
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         self.indexing_receiver = Some(rx);
 
-        let scanned_files = self.scan_result.clone();
-        let search_interface = self.search_interface.as_ref().unwrap().clone();
-
+        // Create a separate thread to handle indexing
         thread::spawn(move || {
-            if let Some(scanned) = scanned_files {
-                let file_paths: Vec<PathBuf> =
-                    scanned.into_iter().map(|sf| sf.local_path).collect();
-                let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-                if let Err(e) = rt.block_on(search_interface.index_files(file_paths)) {
-                    eprintln!("Indexing error: {}", e);
+            // Initialize the database
+            match notemancy_core::db::Database::new() {
+                Ok(db) => {
+                    // Initialize a new search engine instance in this thread
+                    match notemancy_core::search::init_search_engine() {
+                        Ok(engine) => {
+                            // Index all documents from the database
+                            if let Err(e) = engine.index_all_documents(&db) {
+                                eprintln!("Indexing error: {}", e);
+                            }
+                        }
+                        Err(e) => eprintln!("Failed to initialize search engine: {}", e),
+                    }
                 }
+                Err(e) => eprintln!("Failed to connect to database: {}", e),
             }
+
+            // Signal that indexing is complete
             let _ = tx.send(());
         });
     }
@@ -267,11 +276,11 @@ impl App {
             self.selected_search_index = 0;
             return;
         }
-        let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-        if let Some(ref si) = self.search_interface {
-            match rt.block_on(si.search(&self.search_query)) {
-                Ok(docs) => {
-                    self.search_results = docs;
+
+        if let Some(ref search_engine) = self.search_engine {
+            match search_engine.search(&self.search_query, 20) {
+                Ok(results) => {
+                    self.search_results = results;
                     self.selected_search_index = 0;
                 }
                 Err(e) => {
@@ -280,7 +289,7 @@ impl App {
                 }
             }
         } else {
-            eprintln!("Search interface not configured!");
+            eprintln!("Search engine not configured!");
             self.search_results.clear();
         }
     }
