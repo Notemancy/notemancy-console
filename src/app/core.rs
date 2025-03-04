@@ -26,7 +26,6 @@ pub enum AppState {
     Preview,
     Indexing,
     Search,
-    FindRelated,
     CommandPalette,
     IndexingVectors,
 }
@@ -154,13 +153,6 @@ impl App {
                 action: Box::new(|app, terminal| {
                     app.enter_search_mode(terminal);
                     app.state = AppState::Search;
-                }),
-            },
-            crate::app::command_palette::CommandItem {
-                name: "Find Related",
-                description: "Find related documents",
-                action: Box::new(|app, terminal| {
-                    app.enter_find_related_mode(terminal);
                 }),
             },
             crate::app::command_palette::CommandItem {
@@ -316,46 +308,8 @@ impl App {
     ) {
         match self.state {
             AppState::Search => self.handle_search_key(key, terminal),
-            AppState::FindRelated => self.handle_find_related_key(key, terminal), // Add this line
             AppState::CommandPalette => self.handle_command_palette_key(key, terminal),
             _ => self.handle_default_key(key),
-        }
-    }
-
-    fn handle_find_related_key(
-        &mut self,
-        key: KeyEvent,
-        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
-    ) {
-        match key.code {
-            KeyCode::Esc => {
-                self.state = AppState::Preview;
-            }
-            KeyCode::Enter => {
-                if let Some(doc) = self.search_results.get(self.selected_search_index) {
-                    let _ = crate::config_editor::open_file_in_editor(terminal, &doc.path);
-                    self.state = AppState::Preview;
-                }
-            }
-            KeyCode::Char(c) => {
-                self.search_query.push(c);
-                self.perform_search();
-            }
-            KeyCode::Backspace => {
-                self.search_query.pop();
-                self.perform_search();
-            }
-            KeyCode::Up => {
-                if self.selected_search_index > 0 {
-                    self.selected_search_index -= 1;
-                }
-            }
-            KeyCode::Down => {
-                if self.selected_search_index + 1 < self.search_results.len() {
-                    self.selected_search_index += 1;
-                }
-            }
-            _ => {}
         }
     }
 
@@ -477,17 +431,6 @@ impl App {
         }
     }
 
-    pub fn enter_find_related_mode(
-        &mut self,
-        _terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
-    ) {
-        // Clear previous search query/results and switch to FindRelated state.
-        self.search_query.clear();
-        self.search_results.clear();
-        self.selected_search_index = 0;
-        self.state = AppState::FindRelated;
-    }
-
     fn draw(&mut self, frame: &mut ratatui::Frame) {
         let area = frame.area();
         match self.state {
@@ -539,9 +482,6 @@ impl App {
             }
             AppState::Search => {
                 draw_search_ui(self, frame);
-            }
-            AppState::FindRelated => {
-                crate::app::ui::draw_find_related_ui(self, frame);
             }
             AppState::IndexingVectors => {
                 crate::app::ui::draw_vector_indexing_ui(self, frame, area);

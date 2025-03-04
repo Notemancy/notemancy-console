@@ -10,7 +10,6 @@ use ratatui::{
 use crate::app::core::App;
 use crate::app::highlight::{highlight_full_markdown, highlight_matches};
 use std::fs;
-use std::path::Path;
 
 pub fn draw_search_ui(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
@@ -170,69 +169,6 @@ pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         )
         .split(vertical_chunk);
     horizontal_layout[1]
-}
-
-pub fn draw_find_related_ui(app: &mut App, frame: &mut Frame) {
-    let area = frame.area();
-
-    // Top: search input area.
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)].as_ref())
-        .split(area);
-
-    let padded_input = format!(" {} ", app.search_query);
-    let input = Paragraph::new(Line::from(padded_input)).style(
-        Style::default()
-            .fg(Color::Rgb(69, 137, 255))
-            .bg(Color::Rgb(30, 30, 30)),
-    );
-    frame.render_widget(input, chunks[0]);
-
-    // Lower area: split horizontally into two equal halves.
-    let bottom_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-        .split(chunks[1]);
-
-    // Left side: render search results.
-    let items: Vec<ListItem> = app
-        .search_results
-        .iter()
-        .enumerate()
-        .map(|(i, result)| {
-            let style = if i == app.selected_search_index {
-                Style::default()
-                    .fg(Color::Rgb(224, 224, 224))
-                    .bg(Color::Rgb(70, 130, 180)) // steel blue
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-                    .fg(Color::Rgb(198, 198, 198))
-                    .bg(Color::Rgb(22, 22, 22))
-            };
-
-            // Use the file name or title.
-            let display_text = if result.title.is_empty() {
-                let path = Path::new(&result.path);
-                path.file_name()
-                    .and_then(|f| f.to_str())
-                    .unwrap_or(&result.path)
-                    .to_string()
-            } else {
-                result.title.clone()
-            };
-
-            ListItem::new(Span::styled(format!(" {} ", display_text), style))
-        })
-        .collect();
-
-    let results_list = List::new(items).style(Style::default().bg(Color::Rgb(22, 22, 22)));
-    frame.render_widget(results_list, bottom_chunks[0]);
-
-    // Right side: simply display a placeholder (or leave blank).
-    let placeholder = Paragraph::new(" ").style(Style::default().bg(Color::Rgb(22, 22, 22)));
-    frame.render_widget(placeholder, bottom_chunks[1]);
 }
 
 pub fn draw_vector_indexing_ui(app: &App, frame: &mut Frame, area: Rect) {
