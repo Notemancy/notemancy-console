@@ -113,7 +113,7 @@ impl Default for App {
             related_files_error: None,
             last_selected_index: 0,
             last_selection_change: Instant::now(),
-            debounce_duration: Duration::from_millis(500), // 500ms debounce
+            debounce_duration: Duration::from_millis(1000), // 500ms debounce
             current_related_document_path: None,
         }
     }
@@ -558,103 +558,98 @@ impl App {
 
             // Run the async process
             rt.block_on(async {
-                    // Load configuration
-                    match notemancy_core::config::load_config() {
-                        Ok(config) => {
-                            // Create AI instance
-                            match notemancy_core::ai::AI::new(&config).await {
-                                Ok(ai) => {
-                                    // First, ensure vectors are indexed
-                                    if let Err(e) = notemancy_core::vec_indexer::index_markdown_files(&ai).await {
-                                        let _ = tx.send(Err(format!("Error indexing files: {}", e)));
+                // Load configuration
+                match notemancy_core::config::load_config() {
+                    Ok(config) => {
+                        // Create AI instance
+                        match notemancy_core::ai::AI::new(&config).await {
+                            Ok(ai) => {
+                                // First, read the content of the file to use for similarity search
+                                let content = match std::fs::read_to_string(&path) {
+                                    Ok(content) => content,
+                                    Err(e) => {
+                                        let _ = tx.send(Err(format!("Could not read file: {}", e)));
                                         return;
                                     }
+                                };
                                 
-                                    // Now get the content of the file to use for similarity search
-                                    let content = match std::fs::read_to_string(&path) {
-                                        Ok(content) => content,
-                                        Err(e) => {
-                                            let _ = tx.send(Err(format!("Could not read file: {}", e)));
+                                // Use the content directly with find_similar_documents API
+                                // This ensures we're comparing based on content and not just paths
+                                match ai.find_similar_documents(&content, 20, None).await {
+                                    Ok(similar_docs) => {
+                                        if similar_docs.is_empty() {
+                                            let _ = tx.send(Err("No similar documents found.".to_string()));
                                             return;
                                         }
-                                    };
-                                
-                                    // Use the content directly with find_similar_documents API
-                                    match ai.find_similar_documents(&content, 20, None).await {
-                                        Ok(similar_docs) => {
-                                            if similar_docs.is_empty() {
-                                                let _ = tx.send(Err("No similar documents found.".to_string()));
-                                                return;
+                                    
+                                        // Process the results into SearchResult format
+                                        let mut results = Vec::new();
+                                    
+                                        for (doc, score) in similar_docs {
+                                            // Skip if no physical path in metadata
+                                            let Some(rel_path) = doc.metadata.get("physical_path") else {
+                                                continue;
+                                            };
+                                        
+                                            // Skip the current document
+                                            if rel_path == &path {
+                                                continue;
                                             }
                                         
-                                            // Process the results into SearchResult format
-                                            let mut results = Vec::new();
+                                            // Extract title from path
+                                            let title = std::path::Path::new(rel_path)
+                                                .file_stem()
+                                                .and_then(|s| s.to_str())
+                                                .unwrap_or("")
+                                                .to_string();
                                         
-                                            for (doc, score) in similar_docs {
-                                                // Skip if no physical path in metadata
-                                                let Some(rel_path) = doc.metadata.get("physical_path") else {
-                                                    continue;
-                                                };
-                                            
-                                                // Skip the current document
-                                                if rel_path == &path {
-                                                    continue;
-                                                }
-                                            
-                                                // Extract title from path
-                                                let title = std::path::Path::new(rel_path)
-                                                    .file_stem()
-                                                    .and_then(|s| s.to_str())
-                                                    .unwrap_or("")
-                                                    .to_string();
-                                            
-                                                // Convert score (0 is best, 1 is worst in distance metrics)
-                                                // to a similarity percentage (100% is best, 0% is worst)
-                                                let similarity = (1.0 - score) * 100.0;
-                                            
-                                                results.push(notemancy_core::search::SearchResult {
-                                                    path: rel_path.clone(),
-                                                    title,
-                                                    snippet: format!("Similarity: {:.1}%", similarity).into(),
-                                                    score: 1.0 - score, // Higher score = better match in SearchResult
-                                                });
-                                            }
+                                            // Convert score (0 is best, 1 is worst in distance metrics)
+                                            // to a similarity percentage (100% is best, 0% is worst)
+                                            let similarity = (1.0 - score) * 100.0;
                                         
-                                            if results.is_empty() {
-                                                let _ = tx.send(Err("No related documents found (current document excluded).".to_string()));
-                                                return;
-                                            }
-                                        
-                                            // Sort by score (highest first)
-                                            results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-                                        
-                                            // Take top 10
-                                            let top_results = results.into_iter().take(10).collect();
-                                        
-                                            // Send results
-                                            let _ = tx.send(Ok(top_results));
-                                        },
-                                        Err(e) => {
-                                            let _ = tx.send(Err(format!("Error finding similar documents: {}", e)));
+                                            results.push(notemancy_core::search::SearchResult {
+                                                path: rel_path.clone(),
+                                                title,
+                                                snippet: format!("Similarity: {:.1}%", similarity).into(),
+                                                score: 1.0 - score, // Higher score = better match in SearchResult
+                                            });
                                         }
+                                    
+                                        if results.is_empty() {
+                                            let _ = tx.send(Err("No related documents found (current document excluded).".to_string()));
+                                            return;
+                                        }
+                                    
+                                        // Sort by score (highest first)
+                                        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+                                    
+                                        // Take top 10
+                                        let top_results = results.into_iter().take(10).collect();
+                                    
+                                        // Send results
+                                        let _ = tx.send(Ok(top_results));
+                                    },
+                                    Err(e) => {
+                                        let _ = tx.send(Err(format!("Error finding similar documents: {}", e)));
                                     }
-                                },
-                                Err(e) => {
-                                    let _ = tx.send(Err(format!("Error initializing AI: {}", e)));
                                 }
+                            },
+                            Err(e) => {
+                                let _ = tx.send(Err(format!("Error initializing AI: {}", e)));
                             }
-                        },
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Error loading config: {}", e)));
                         }
+                    },
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("Error loading config: {}", e)));
                     }
-                });
+                }
             });
-        } else {
-            // No selected item, immediately clear loading state
-            self.is_loading_related_files = false;
-        }
+        });
+    } else {
+        // No selected item, immediately clear loading state
+        self.is_loading_related_files = false;
     }
+}
 
     pub fn process(&mut self) {
     // Only do this for search mode in related files view
