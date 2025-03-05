@@ -20,6 +20,18 @@ use std::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DetailViewMode {
+    Preview,
+    RelatedFiles,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InputMode {
+    Normal,  // Navigation mode where shortcuts work
+    Editing, // Text input mode for the search query
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AppState {
     Starting,
     Scanning,
@@ -49,6 +61,9 @@ pub struct App {
     // Store the search interface.
     pub search_engine: Option<SearchEngine>,
     pub indexing_receiver: IndexReceiver,
+    pub detail_view_mode: DetailViewMode,
+    pub related_files: Vec<SearchResult>,
+    pub input_mode: InputMode,
     // Command palette fields:
     pub command_items: Vec<CommandItem>,
     pub selected_command_index: usize,
@@ -80,6 +95,9 @@ impl Default for App {
             vector_indexing_complete: false,
             vector_indexing_success_time: None,
             vector_indexing_receiver: None,
+            detail_view_mode: DetailViewMode::Preview,
+            related_files: Vec::new(),
+            input_mode: InputMode::Editing,
         }
     }
 }
@@ -399,35 +417,89 @@ impl App {
         key: KeyEvent,
         terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
     ) {
-        match key.code {
-            KeyCode::Esc => {
-                self.state = AppState::Preview;
-            }
-            KeyCode::Enter => {
-                if let Some(doc) = self.search_results.get(self.selected_search_index) {
-                    let _ = crate::config_editor::open_file_in_editor(terminal, &doc.path);
-                    self.state = AppState::Preview;
+        match self.input_mode {
+            InputMode::Normal => {
+                match key.code {
+                    // In Normal mode, handle navigation and view toggling
+                    KeyCode::Esc => {
+                        self.state = AppState::Preview;
+                    }
+                    KeyCode::Enter => {
+                        if let Some(doc) = self.search_results.get(self.selected_search_index) {
+                            let _ = crate::config_editor::open_file_in_editor(terminal, &doc.path);
+                            self.state = AppState::Preview;
+                        }
+                    }
+                    KeyCode::Tab | KeyCode::Char('r') => {
+                        // Toggle between Preview and RelatedFiles modes
+                        self.detail_view_mode = match self.detail_view_mode {
+                            DetailViewMode::Preview => {
+                                // When switching to RelatedFiles, we might want to fetch the related files
+                                self.get_related_files_for_selected();
+                                DetailViewMode::RelatedFiles
+                            }
+                            DetailViewMode::RelatedFiles => DetailViewMode::Preview,
+                        };
+                    }
+                    KeyCode::Char('/') => {
+                        // Enter editing mode with '/'
+                        self.input_mode = InputMode::Editing;
+                    }
+                    KeyCode::Up => {
+                        if self.selected_search_index > 0 {
+                            self.selected_search_index -= 1;
+                        }
+                    }
+                    KeyCode::Down => {
+                        if self.selected_search_index + 1 < self.search_results.len() {
+                            self.selected_search_index += 1;
+                        }
+                    }
+                    _ => {}
                 }
             }
-            KeyCode::Char(c) => {
-                self.search_query.push(c);
-                self.perform_search();
-            }
-            KeyCode::Backspace => {
-                self.search_query.pop();
-                self.perform_search();
-            }
-            KeyCode::Up => {
-                if self.selected_search_index > 0 {
-                    self.selected_search_index -= 1;
+            InputMode::Editing => {
+                match key.code {
+                    KeyCode::Esc => {
+                        // Exit editing mode with Escape
+                        self.input_mode = InputMode::Normal;
+                    }
+                    KeyCode::Enter => {
+                        // Perform search and exit editing mode
+                        self.perform_search();
+                        self.input_mode = InputMode::Normal;
+                    }
+                    KeyCode::Char(c) => {
+                        // Add character to search query while in editing mode
+                        self.search_query.push(c);
+                        self.perform_search();
+                    }
+                    KeyCode::Backspace => {
+                        // Delete character from search query
+                        self.search_query.pop();
+                        self.perform_search();
+                    }
+                    _ => {}
                 }
             }
-            KeyCode::Down => {
-                if self.selected_search_index + 1 < self.search_results.len() {
-                    self.selected_search_index += 1;
-                }
-            }
-            _ => {}
+        }
+    }
+
+    fn get_related_files_for_selected(&mut self) {
+        // This is a placeholder - you mentioned you'll implement the actual related files logic later
+        // For now, we'll just set up the structure
+        self.related_files.clear();
+
+        if let Some(selected_result) = self.search_results.get(self.selected_search_index) {
+            // In the future, you would call your backend API here to get related files
+            // For now, we'll leave it empty
+
+            // Example placeholder (commented out):
+            // if let Some(ref engine) = self.search_engine {
+            //     if let Ok(related) = engine.find_related_files(&selected_result.path) {
+            //         self.related_files = related;
+            //     }
+            // }
         }
     }
 

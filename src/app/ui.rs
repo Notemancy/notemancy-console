@@ -8,6 +8,7 @@ use ratatui::{
 };
 
 use crate::app::core::App;
+use crate::app::core::{DetailViewMode, InputMode};
 use crate::app::highlight::{highlight_full_markdown, highlight_matches};
 use std::fs;
 
@@ -18,29 +19,43 @@ pub fn draw_search_ui(app: &mut App, frame: &mut Frame) {
         .constraints([Constraint::Length(1), Constraint::Min(0)].as_ref())
         .split(area);
 
-    let padded_input = format!(" {} ", app.search_query);
-    let input = Line::from(padded_input).style(
-        Style::default()
+    // Search input at the top (same as before)
+    // Search input at top with visual indicator of input mode
+    let mut padded_input = format!(" {} ", app.search_query);
+
+    // Add cursor indicator if in editing mode
+    if app.input_mode == InputMode::Editing {
+        padded_input.push('|'); // Simple cursor
+    }
+
+    let input_style = match app.input_mode {
+        InputMode::Editing => Style::default()
+            .fg(Color::Rgb(69, 137, 255))
+            .bg(Color::Rgb(40, 40, 40)), // Slightly brighter background when editing
+        InputMode::Normal => Style::default()
             .fg(Color::Rgb(69, 137, 255))
             .bg(Color::Rgb(30, 30, 30)),
-    );
+    };
+
+    let input = Line::from(padded_input).style(input_style);
     frame.render_widget(input, chunks[0]);
 
+    // Split bottom area for results list and detail panel
     let bottom_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)].as_ref())
         .split(chunks[1]);
 
+    // Render search results list (same as before)
     let items: Vec<ListItem> = app
         .search_results
         .iter()
         .enumerate()
         .map(|(i, result)| {
             let style = if i == app.selected_search_index {
-                // Use blue background for the selected item.
                 Style::default()
                     .fg(Color::Rgb(224, 224, 224))
-                    .bg(Color::Rgb(70, 130, 180)) // steel blue
+                    .bg(Color::Rgb(70, 130, 180))
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -48,9 +63,7 @@ pub fn draw_search_ui(app: &mut App, frame: &mut Frame) {
                     .bg(Color::Rgb(22, 22, 22))
             };
 
-            // Display title (if available) or just the filename
             let display_text = if result.title.is_empty() {
-                // Extract filename from path if no title
                 let path = std::path::Path::new(&result.path);
                 path.file_name()
                     .and_then(|f| f.to_str())
@@ -67,51 +80,168 @@ pub fn draw_search_ui(app: &mut App, frame: &mut Frame) {
     let results_list = List::new(items).style(Style::default().bg(Color::Rgb(22, 22, 22)));
     frame.render_widget(results_list, bottom_chunks[0]);
 
-    if let Some(result) = app.search_results.get(app.selected_search_index) {
-        // Read the content of the selected file
-        let content = match fs::read_to_string(&result.path) {
-            Ok(content) => content,
-            Err(e) => {
-                format!("Error reading file: {}", e)
+    // Render the detail panel based on the current mode
+    match app.detail_view_mode {
+        DetailViewMode::Preview => {
+            // Existing preview logic
+            if let Some(result) = app.search_results.get(app.selected_search_index) {
+                let content = match fs::read_to_string(&result.path) {
+                    Ok(content) => content,
+                    Err(e) => format!("Error reading file: {}", e),
+                };
+
+                let mut highlighted = highlight_full_markdown(&content);
+                if !app.search_query.is_empty() {
+                    highlighted = highlighted
+                        .into_iter()
+                        .map(|line| highlight_matches(&line, &app.search_query))
+                        .collect();
+                }
+
+                let preview_block = Block::default()
+                    .title(format!("Preview: {}", result.title))
+                    .padding(Padding {
+                        left: 2,
+                        right: 2,
+                        top: 1,
+                        bottom: 1,
+                    })
+                    .borders(Borders::NONE);
+
+                let preview = Paragraph::new(highlighted)
+                    .style(
+                        Style::default()
+                            .fg(Color::Rgb(224, 224, 224))
+                            .bg(Color::Rgb(38, 38, 38)),
+                    )
+                    .alignment(ratatui::layout::Alignment::Left)
+                    .block(preview_block);
+
+                frame.render_widget(preview, bottom_chunks[1]);
+            } else {
+                let preview = Paragraph::new("No file selected.")
+                    .style(
+                        Style::default()
+                            .fg(Color::Rgb(224, 224, 224))
+                            .bg(Color::Rgb(38, 38, 38)),
+                    )
+                    .alignment(ratatui::layout::Alignment::Left);
+                frame.render_widget(preview, bottom_chunks[1]);
             }
-        };
-
-        let mut highlighted = highlight_full_markdown(&content);
-        // Overlay match highlighting if needed.
-        if !app.search_query.is_empty() {
-            highlighted = highlighted
-                .into_iter()
-                .map(|line| highlight_matches(&line, &app.search_query))
-                .collect();
         }
+        DetailViewMode::RelatedFiles => {
+            // New logic for displaying related files
+            let title = if let Some(result) = app.search_results.get(app.selected_search_index) {
+                format!("Related Files: {}", result.title)
+            } else {
+                "Related Files".to_string()
+            };
 
-        let preview_block = ratatui::widgets::Block::default().padding(Padding {
-            left: (2),
-            right: (2),
-            top: (1),
-            bottom: (1),
-        });
+            let related_block = Block::default()
+                .title(title)
+                .padding(Padding {
+                    left: 2,
+                    right: 2,
+                    top: 1,
+                    bottom: 1,
+                })
+                .borders(Borders::NONE);
 
-        let preview = Paragraph::new(highlighted)
-            .style(
-                Style::default()
-                    .fg(Color::Rgb(224, 224, 224))
-                    .bg(Color::Rgb(38, 38, 38)),
-            )
-            .alignment(ratatui::layout::Alignment::Left)
-            .block(preview_block);
+            if !app.related_files.is_empty() {
+                // Display the list of related files
+                let related_items: Vec<ListItem> = app
+                    .related_files
+                    .iter()
+                    .map(|result| {
+                        let display_text = if result.title.is_empty() {
+                            let path = std::path::Path::new(&result.path);
+                            path.file_name()
+                                .and_then(|f| f.to_str())
+                                .unwrap_or(&result.path)
+                                .to_string()
+                        } else {
+                            result.title.clone()
+                        };
 
-        frame.render_widget(preview, bottom_chunks[1]);
-    } else {
-        let preview = Paragraph::new("No file selected.")
-            .style(
-                Style::default()
-                    .fg(Color::Rgb(224, 224, 224))
-                    .bg(Color::Rgb(38, 38, 38)),
-            )
-            .alignment(ratatui::layout::Alignment::Left);
-        frame.render_widget(preview, bottom_chunks[1]);
+                        // Create a Line from multiple spans
+                        ListItem::new(Line::from(vec![
+                            Span::styled(
+                                format!("• {} ", display_text),
+                                Style::default().fg(Color::Rgb(224, 224, 224)),
+                            ),
+                            Span::styled(
+                                format!("({})", result.path),
+                                Style::default().fg(Color::Rgb(150, 150, 150)),
+                            ),
+                        ]))
+                    })
+                    .collect();
+
+                let related_list = List::new(related_items)
+                    .style(
+                        Style::default()
+                            .fg(Color::Rgb(224, 224, 224))
+                            .bg(Color::Rgb(38, 38, 38)),
+                    )
+                    .block(related_block);
+
+                frame.render_widget(related_list, bottom_chunks[1]);
+            } else {
+                // Display a message when there are no related files
+                let related_msg = Paragraph::new("No related files found.")
+                    .style(
+                        Style::default()
+                            .fg(Color::Rgb(224, 224, 224))
+                            .bg(Color::Rgb(38, 38, 38)),
+                    )
+                    .alignment(ratatui::layout::Alignment::Left)
+                    .block(related_block);
+
+                frame.render_widget(related_msg, bottom_chunks[1]);
+            }
+        }
     }
+
+    // Add a help text at the bottom of the screen
+    let help_area = Rect {
+        x: area.x,
+        y: area.height - 1,
+        width: area.width,
+        height: 1,
+    };
+
+    let mode_text = match app.detail_view_mode {
+        DetailViewMode::Preview => "PREVIEW",
+        DetailViewMode::RelatedFiles => "RELATED FILES",
+    };
+
+    let mode_indicator = if app.input_mode == InputMode::Editing {
+        "EDITING"
+    } else {
+        "NORMAL"
+    };
+
+    let help_text = Line::from(vec![
+        Span::styled(" ESC ", Style::default().bg(Color::Gray).fg(Color::Black)),
+        Span::raw(if app.input_mode == InputMode::Editing {
+            " Exit Editing | "
+        } else {
+            " Exit Search | "
+        }),
+        Span::styled(" / ", Style::default().bg(Color::Gray).fg(Color::Black)),
+        Span::raw(" Enter Edit Mode | "),
+        Span::styled(" Tab/r ", Style::default().bg(Color::Gray).fg(Color::Black)),
+        Span::raw(format!(" Toggle View [{}] | ", mode_text)),
+        Span::styled(
+            format!(" {} ", mode_indicator),
+            Style::default().bg(Color::Blue).fg(Color::White),
+        ),
+    ]);
+
+    let help_paragraph =
+        Paragraph::new(help_text).style(Style::default().bg(Color::Rgb(22, 22, 22)));
+
+    frame.render_widget(help_paragraph, help_area);
 }
 
 pub fn draw_command_palette(app: &App, frame: &mut Frame, area: Rect) {
