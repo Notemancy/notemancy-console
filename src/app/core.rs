@@ -64,6 +64,12 @@ pub struct App {
     pub detail_view_mode: DetailViewMode,
     pub related_files: Vec<SearchResult>,
     pub input_mode: InputMode,
+
+    pub is_loading_related_files: bool,
+    pub related_files_receiver: Option<
+        std::sync::mpsc::Receiver<Result<Vec<notemancy_core::search::SearchResult>, String>>,
+    >,
+    pub related_files_error: Option<String>,
     // Command palette fields:
     pub command_items: Vec<CommandItem>,
     pub selected_command_index: usize,
@@ -71,6 +77,10 @@ pub struct App {
     pub vector_indexing_complete: bool,         // Flag to indicate when indexing is complete
     pub vector_indexing_success_time: Option<Instant>,
     pub vector_indexing_receiver: Option<std::sync::mpsc::Receiver<String>>,
+    pub last_selected_index: usize,
+    pub last_selection_change: std::time::Instant,
+    pub debounce_duration: std::time::Duration,
+    pub current_related_document_path: Option<String>,
 }
 
 impl Default for App {
@@ -98,6 +108,13 @@ impl Default for App {
             detail_view_mode: DetailViewMode::Preview,
             related_files: Vec::new(),
             input_mode: InputMode::Editing,
+            is_loading_related_files: false,
+            related_files_receiver: None,
+            related_files_error: None,
+            last_selected_index: 0,
+            last_selection_change: Instant::now(),
+            debounce_duration: Duration::from_millis(500), // 500ms debounce
+            current_related_document_path: None,
         }
     }
 }
@@ -312,6 +329,9 @@ impl App {
                 }
             }
 
+            // self.process_related_files_receiver();
+            self.process();
+
             terminal.draw(|frame| self.draw(frame))?;
         }
 
@@ -434,12 +454,24 @@ impl App {
                         // Toggle between Preview and RelatedFiles modes
                         self.detail_view_mode = match self.detail_view_mode {
                             DetailViewMode::Preview => {
-                                // When switching to RelatedFiles, we might want to fetch the related files
-                                self.get_related_files_for_selected();
+                                // When switching to RelatedFiles, we fetch the related files immediately
                                 DetailViewMode::RelatedFiles
                             }
                             DetailViewMode::RelatedFiles => DetailViewMode::Preview,
                         };
+                    
+                        // If we just switched to RelatedFiles, update immediately
+                        if self.detail_view_mode == DetailViewMode::RelatedFiles && !self.is_loading_related_files {
+                            // Clear any existing related files
+                            self.related_files.clear();
+                            self.related_files_error = None;
+                        
+                            // Set last selected index to current so we don't trigger again on the same item
+                            self.last_selected_index = self.selected_search_index;
+                        
+                            // Update immediately
+                            self.get_related_files_for_selected();
+                        }
                     }
                     KeyCode::Char('/') => {
                         // Enter editing mode with '/'
@@ -447,12 +479,26 @@ impl App {
                     }
                     KeyCode::Up => {
                         if self.selected_search_index > 0 {
+                            let old_selection = self.selected_search_index;
                             self.selected_search_index -= 1;
+                        
+                            // Only mark as changed if actually changed
+                            if old_selection != self.selected_search_index 
+                              && self.detail_view_mode == DetailViewMode::RelatedFiles {
+                                self.last_selection_change = Instant::now();
+                            }
                         }
                     }
                     KeyCode::Down => {
                         if self.selected_search_index + 1 < self.search_results.len() {
+                            let old_selection = self.selected_search_index;
                             self.selected_search_index += 1;
+                        
+                            // Only mark as changed if actually changed
+                            if old_selection != self.selected_search_index 
+                              && self.detail_view_mode == DetailViewMode::RelatedFiles {
+                                self.last_selection_change = Instant::now();
+                            }
                         }
                     }
                     _ => {}
@@ -486,20 +532,208 @@ impl App {
     }
 
     fn get_related_files_for_selected(&mut self) {
-        // This is a placeholder - you mentioned you'll implement the actual related files logic later
-        // For now, we'll just set up the structure
-        self.related_files.clear();
+    // Don't do anything if we're already loading
+    if self.is_loading_related_files {
+        return;
+    }
+    
+    // Clear existing related files
+    self.related_files.clear();
+    self.is_loading_related_files = true;
+    self.related_files_error = None;
 
-        if let Some(selected_result) = self.search_results.get(self.selected_search_index) {
-            // In the future, you would call your backend API here to get related files
-            // For now, we'll leave it empty
+    // If we have a selected search result, find related files for it
+    if let Some(selected_result) = self.search_results.get(self.selected_search_index) {
+        // Create a channel to communicate results
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.related_files_receiver = Some(rx);
 
-            // Example placeholder (commented out):
-            // if let Some(ref engine) = self.search_engine {
-            //     if let Ok(related) = engine.find_related_files(&selected_result.path) {
-            //         self.related_files = related;
-            //     }
-            // }
+        // Clone the path to use in the thread
+        let path = selected_result.path.clone();
+
+        // Spawn a thread to handle the async operation
+        std::thread::spawn(move || {
+            // Initialize runtime for async operations
+            let rt = tokio::runtime::Runtime::new().unwrap();
+
+            // Run the async process
+            rt.block_on(async {
+                    // Load configuration
+                    match notemancy_core::config::load_config() {
+                        Ok(config) => {
+                            // Create AI instance
+                            match notemancy_core::ai::AI::new(&config).await {
+                                Ok(ai) => {
+                                    // First, ensure vectors are indexed
+                                    if let Err(e) = notemancy_core::vec_indexer::index_markdown_files(&ai).await {
+                                        let _ = tx.send(Err(format!("Error indexing files: {}", e)));
+                                        return;
+                                    }
+                                
+                                    // Now get the content of the file to use for similarity search
+                                    let content = match std::fs::read_to_string(&path) {
+                                        Ok(content) => content,
+                                        Err(e) => {
+                                            let _ = tx.send(Err(format!("Could not read file: {}", e)));
+                                            return;
+                                        }
+                                    };
+                                
+                                    // Use the content directly with find_similar_documents API
+                                    match ai.find_similar_documents(&content, 20, None).await {
+                                        Ok(similar_docs) => {
+                                            if similar_docs.is_empty() {
+                                                let _ = tx.send(Err("No similar documents found.".to_string()));
+                                                return;
+                                            }
+                                        
+                                            // Process the results into SearchResult format
+                                            let mut results = Vec::new();
+                                        
+                                            for (doc, score) in similar_docs {
+                                                // Skip if no physical path in metadata
+                                                let Some(rel_path) = doc.metadata.get("physical_path") else {
+                                                    continue;
+                                                };
+                                            
+                                                // Skip the current document
+                                                if rel_path == &path {
+                                                    continue;
+                                                }
+                                            
+                                                // Extract title from path
+                                                let title = std::path::Path::new(rel_path)
+                                                    .file_stem()
+                                                    .and_then(|s| s.to_str())
+                                                    .unwrap_or("")
+                                                    .to_string();
+                                            
+                                                // Convert score (0 is best, 1 is worst in distance metrics)
+                                                // to a similarity percentage (100% is best, 0% is worst)
+                                                let similarity = (1.0 - score) * 100.0;
+                                            
+                                                results.push(notemancy_core::search::SearchResult {
+                                                    path: rel_path.clone(),
+                                                    title,
+                                                    snippet: format!("Similarity: {:.1}%", similarity).into(),
+                                                    score: 1.0 - score, // Higher score = better match in SearchResult
+                                                });
+                                            }
+                                        
+                                            if results.is_empty() {
+                                                let _ = tx.send(Err("No related documents found (current document excluded).".to_string()));
+                                                return;
+                                            }
+                                        
+                                            // Sort by score (highest first)
+                                            results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+                                        
+                                            // Take top 10
+                                            let top_results = results.into_iter().take(10).collect();
+                                        
+                                            // Send results
+                                            let _ = tx.send(Ok(top_results));
+                                        },
+                                        Err(e) => {
+                                            let _ = tx.send(Err(format!("Error finding similar documents: {}", e)));
+                                        }
+                                    }
+                                },
+                                Err(e) => {
+                                    let _ = tx.send(Err(format!("Error initializing AI: {}", e)));
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            let _ = tx.send(Err(format!("Error loading config: {}", e)));
+                        }
+                    }
+                });
+            });
+        } else {
+            // No selected item, immediately clear loading state
+            self.is_loading_related_files = false;
+        }
+    }
+
+    pub fn process(&mut self) {
+    // Only do this for search mode in related files view
+    if self.state == AppState::Search && 
+       self.detail_view_mode == DetailViewMode::RelatedFiles && 
+       !self.is_loading_related_files && 
+       !self.search_results.is_empty() {
+        
+        // First, collect all the information we need without holding references
+        let should_load = if let Some(selected_result) = self.search_results.get(self.selected_search_index) {
+            let current_path = selected_result.path.clone();
+            
+            // Check if we already have related files for this document
+            match &self.current_related_document_path {
+                // If we haven't loaded related files for any document yet
+                None => {
+                    // We should load related files for the current document
+                    Some(current_path)
+                },
+                // If we've loaded related files before
+                Some(loaded_path) => {
+                    // Only load if the path has changed (different document selected)
+                    if loaded_path != &current_path {
+                        Some(current_path)
+                    } else {
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        
+        // Now perform the action based on what we determined
+        if let Some(path) = should_load {
+            // Load related files for the new document
+            self.get_related_files_for_selected();
+            // Update which document we loaded for
+            self.current_related_document_path = Some(path);
+        }
+    }
+    
+    // Process any completed related files requests
+    self.process_related_files_receiver();
+}
+
+
+
+    pub fn process_related_files_receiver(&mut self) {
+        if let Some(ref rx) = self.related_files_receiver {
+            match rx.try_recv() {
+                Ok(result) => {
+                    match result {
+                        Ok(results) => {
+                            if results.is_empty() {
+                                self.related_files_error = Some("No related documents found that meet the similarity threshold.".to_string());
+                            } else {
+                                self.related_files = results;
+                                self.related_files_error = None;
+                            }
+                        }
+                        Err(error_msg) => {
+                            self.related_files_error = Some(error_msg);
+                        }
+                    }
+                    self.is_loading_related_files = false;
+                    self.related_files_receiver = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Still waiting for results
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Channel closed without sending results
+                    self.is_loading_related_files = false;
+                    self.related_files_receiver = None;
+                    self.related_files_error =
+                        Some("Failed to process related files request".to_string());
+                }
+            }
         }
     }
 

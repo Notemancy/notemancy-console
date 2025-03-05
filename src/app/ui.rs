@@ -147,7 +147,34 @@ pub fn draw_search_ui(app: &mut App, frame: &mut Frame) {
                 })
                 .borders(Borders::NONE);
 
-            if !app.related_files.is_empty() {
+            if app.is_loading_related_files {
+                // Display a loading spinner while fetching related files
+                let spinner = app.spinner_chars[app.spinner_idx];
+                let loading_text = format!("{} Finding related files...", spinner);
+
+                let loading_paragraph = Paragraph::new(loading_text)
+                    .style(
+                        Style::default()
+                            .fg(Color::Rgb(255, 204, 0)) // Amber color for loading
+                            .bg(Color::Rgb(38, 38, 38)),
+                    )
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .block(related_block);
+
+                frame.render_widget(loading_paragraph, bottom_chunks[1]);
+            } else if let Some(error) = &app.related_files_error {
+                // Display error message if there was a problem
+                let error_paragraph = Paragraph::new(format!("Error: {}", error))
+                    .style(
+                        Style::default()
+                            .fg(Color::Rgb(255, 0, 0)) // Red for error
+                            .bg(Color::Rgb(38, 38, 38)),
+                    )
+                    .alignment(ratatui::layout::Alignment::Left)
+                    .block(related_block);
+
+                frame.render_widget(error_paragraph, bottom_chunks[1]);
+            } else if !app.related_files.is_empty() {
                 // Display the list of related files
                 let related_items: Vec<ListItem> = app
                     .related_files
